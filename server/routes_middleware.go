@@ -1,6 +1,9 @@
 package server
 
 import (
+	"database/sql"
+	"errors"
+	"log"
 	"net/http"
 
 	"docklog/config"
@@ -65,26 +68,33 @@ func (s *Server) passwordChangeMiddleware() echo.MiddlewareFunc {
 			}
 
 			if err := middleware.RefreshClaimsFromDB(claims); err != nil {
-				switch err.Error() {
-				case "account deactivated":
+				switch {
+				case errors.Is(err, middleware.ErrAccountDeactivated):
 					return c.JSON(http.StatusForbidden, map[string]string{
 						"error": "Account deactivated. Please contact administrator.",
 						"code":  "ACCOUNT_DEACTIVATED",
 					})
-				case "session invalidated":
+				case errors.Is(err, middleware.ErrSessionInvalidated):
 					return c.JSON(http.StatusUnauthorized, map[string]string{
 						"error": "Session invalidated. Password was changed. Please re-login.",
 						"code":  "SESSION_INVALIDATED",
 					})
+				case errors.Is(err, middleware.ErrUserNotFound):
+					return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Invalid session"})
 				default:
-					return c.JSON(http.StatusUnauthorized, map[string]string{"error": "User verification failed"})
+					log.Printf("Authentication user verification failed: %v", err)
+					return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "Authentication service temporarily unavailable. Please try again."})
 				}
 			}
 
 			var changed bool
 			err := db.DB.QueryRow("SELECT password_changed FROM users WHERE id = ?", claims.ID).Scan(&changed)
 			if err != nil {
-				return c.JSON(http.StatusUnauthorized, map[string]string{"error": "User verification failed"})
+				if errors.Is(err, sql.ErrNoRows) {
+					return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Invalid session"})
+				}
+				log.Printf("Authentication password-status verification failed: %v", err)
+				return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "Authentication service temporarily unavailable. Please try again."})
 			}
 
 			if c.Path() == "/api/user/change-password" || c.Path() == "/api/user/me" {
