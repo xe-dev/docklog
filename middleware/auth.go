@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -41,6 +43,13 @@ var (
 const (
 	accessTokenTTL  = 7 * 24 * time.Hour
 	refreshTokenTTL = 30 * 24 * time.Hour
+)
+
+var (
+	ErrAccountDeactivated     = errors.New("account deactivated")
+	ErrSessionInvalidated     = errors.New("session invalidated")
+	ErrUserNotFound           = errors.New("user not found")
+	ErrPasswordChangeRequired = errors.New("password change required")
 )
 
 type loginRateLimiter struct {
@@ -519,14 +528,17 @@ func RefreshClaimsFromDB(claims *models.UserClaims) error {
 		&isAdmin, &canStart, &canStop, &canRestart, &canDelete, &canShell, &isRestricted, &allowedContainers, &username,
 	)
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("load user auth claims: %w", err)
 	}
 
 	if !active {
-		return fmt.Errorf("account deactivated")
+		return ErrAccountDeactivated
 	}
 	if claims.PasswordVersion != dbPwdVersion {
-		return fmt.Errorf("session invalidated")
+		return ErrSessionInvalidated
 	}
 
 	claims.IsAdmin = isAdmin
@@ -566,10 +578,13 @@ func validateUserClaims(claims *models.UserClaims, requirePasswordChanged bool) 
 	var changed bool
 	err := db.DB.QueryRow("SELECT password_changed FROM users WHERE id = ?", claims.ID).Scan(&changed)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("load password change status: %w", err)
 	}
 	if requirePasswordChanged && !changed {
-		return nil, fmt.Errorf("password change required")
+		return nil, ErrPasswordChangeRequired
 	}
 
 	return claims, nil
@@ -623,15 +638,15 @@ func UpgradeAuthenticatedWS(c echo.Context) (*websocket.Conn, error) {
 
 func WSAuthError(c echo.Context, err error) error {
 	msg := "Authentication required"
-	switch err.Error() {
-	case "invalid token", "missing token":
-		msg = err.Error()
-	case "account deactivated":
+	switch {
+	case errors.Is(err, ErrAccountDeactivated):
 		msg = "Account deactivated"
-	case "session invalidated":
+	case errors.Is(err, ErrSessionInvalidated):
 		msg = "Session invalidated"
-	case "password change required":
+	case errors.Is(err, ErrPasswordChangeRequired):
 		msg = "Password change required"
+	case err.Error() == "invalid token", err.Error() == "missing token":
+		msg = err.Error()
 	}
 	return c.JSON(http.StatusUnauthorized, map[string]string{"error": msg})
 }
